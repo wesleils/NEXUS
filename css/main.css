@@ -58,9 +58,8 @@ a { color: var(--accent); text-decoration: none; }
 .topbar-logo {
   display: flex; align-items: center; gap: 10px;
   font-size: 20px; font-weight: 800; letter-spacing: -0.5px;
-  background: linear-gradient(135deg, var(--accent), var(--accent2));
-  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
 }
+.topbar-logo img { flex-shrink: 0; }
 .logo-mark {
   width: 32px; height: 32px;
   background: linear-gradient(135deg, var(--accent), var(--accent2));
@@ -356,7 +355,7 @@ a { color: var(--accent); text-decoration: none; }
   border-radius: 20px; padding: 36px; width: 100%; max-width: 400px;
   position: relative; z-index: 1; box-shadow: 0 24px 64px rgba(0,0,0,0.4);
 }
-.auth-logo { display: flex; align-items: center; gap: 12px; margin-bottom: 28px; justify-content: center; }
+.auth-logo { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; justify-content: center; }
 .auth-logo-mark {
   width: 44px; height: 44px; background: linear-gradient(135deg, var(--accent), var(--accent2));
   border-radius: 13px; display: flex; align-items: center; justify-content: center; font-size: 22px;
