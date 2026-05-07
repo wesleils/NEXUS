@@ -1,0 +1,1044 @@
+// ============================================================
+// NEXUS - App principal (app.js)
+// ============================================================
+
+// Estado global
+let state = {
+  wallet: null,
+  transactions: [],
+  categories: [],
+  investments: [],
+  savings: [],
+  goals: [],
+  debts: [],
+  calendarBills: [],
+  activeSection: 'overview'
+};
+
+// ── INICIALIZAÇÃO ────────────────────────────────────────────
+async function initApp() {
+  try {
+    // Carregar tema do localStorage IMEDIATAMENTE (sem precisar de login)
+    const savedTheme = localStorage.getItem('nexus_theme') || 'nexus-dark';
+    const savedCustom = JSON.parse(localStorage.getItem('nexus_theme_custom') || '{}');
+    const savedFont = localStorage.getItem('nexus_font') || 'syne';
+    applyTheme(savedTheme, savedCustom, savedFont);
+
+    showLoader(false);
+    showAuthScreen();
+
+    // Verificar sessão ativa
+    const loggedIn = await initAuth();
+    if (loggedIn) {
+      showAppScreen();
+      await loadAllData();
+      setupEventListeners();
+      // Sincronizar com Supabase em background (não bloqueia)
+      syncThemeFromDB();
+    }
+  } catch (e) {
+    console.error('Erro ao inicializar:', e);
+    showLoader(false);
+    showAuthScreen();
+  }
+}
+
+// Sincronizar tema do banco sem bloquear a UI
+async function syncThemeFromDB() {
+  try {
+    const settings = await DB.getSettings();
+    if (!settings) return;
+    const custom = settings.theme_custom || {};
+    const font = custom._font || localStorage.getItem('nexus_font') || 'syne';
+    const themeName = settings.theme_name || 'nexus-dark';
+    // Só aplica se for diferente do que já está
+    if (themeName !== localStorage.getItem('nexus_theme') ||
+        font !== localStorage.getItem('nexus_font')) {
+      applyTheme(themeName, custom, font);
+    }
+  } catch { /* silencioso */ }
+}
+
+// Carregar todos os dados
+async function loadAllData() {
+  const [wallet, transactions, categories, investments, savings, goals, debts, calendarBills] = await Promise.all([
+    DB.getWallet(),
+    DB.getTransactions(),
+    DB.getCategories(),
+    DB.getInvestments(),
+    DB.getSavings(),
+    DB.getGoals(),
+    DB.getDebts(),
+    DB.getCalendarBills()
+  ]);
+
+  state = { ...state, wallet, transactions, categories, investments, savings, goals, debts, calendarBills };
+
+  renderAll();
+}
+
+function renderAll() {
+  renderSummaryCards();
+  renderTransactions();
+  renderCategories();
+  renderSavingsList();
+  renderGoalsList();
+  renderDebtsList();
+  renderCalendar();
+  loadInvestments();
+  updateAllCharts();
+}
+
+// ── SUMMARY CARDS ────────────────────────────────────────────
+async function updateDashboardSummary() {
+  state.wallet = await DB.getWallet();
+  state.investments = await DB.getInvestments();
+  state.savings = await DB.getSavings();
+  state.goals = await DB.getGoals();
+  state.debts = await DB.getDebts();
+  renderSummaryCards();
+  updateAllCharts();
+}
+
+function renderSummaryCards() {
+  const w = state.wallet || {};
+  const totalInv = state.investments.reduce((s, i) => s + i.total_invested, 0);
+  const totalSav = state.savings.reduce((s, i) => s + i.amount, 0);
+  const totalGoals = state.goals.reduce((s, i) => s + i.current_amount, 0);
+  // Dívidas: soma das parcelas restantes
+  const totalDebt = state.debts.reduce((s, d) => {
+    const remaining = Math.max(0, d.total_installments - d.paid_installments);
+    return s + (d.installment_value * remaining);
+  }, 0);
+  // Patrimônio: carteira + investimentos + poupança + metas (dívidas são passivo, não subtraem aqui)
+  const totalPatrimony = (w.balance || 0) + totalInv + totalSav + totalGoals;
+
+  setEl('summary-balance',   formatCurrency(w.balance));
+  setEl('summary-income',    formatCurrency(w.total_income));
+  setEl('summary-expense',   formatCurrency(w.total_expense));
+  setEl('summary-invested',  formatCurrency(totalInv));
+  setEl('summary-savings',   formatCurrency(totalSav));
+  setEl('summary-goals',     formatCurrency(totalGoals));
+  setEl('summary-debt',      formatCurrency(totalDebt));
+  setEl('summary-patrimony', formatCurrency(totalPatrimony));
+
+  setEl('user-name', getUserName());
+  setEl('user-initials', getUserInitials());
+  // Atualizar mini-listas da visão geral
+  renderCalendarOverview();
+  if (typeof renderInvestmentsOverview === 'function') renderInvestmentsOverview();
+
+  // Atualizar overview com últimas transações
+  const overviewList = document.getElementById('overview-tx-list');
+  if (overviewList && state.transactions.length) {
+    const top = state.transactions.slice(0, 8);
+    overviewList.innerHTML = top.map(tx => {
+      const color = tx.categories?.color || 'var(--accent)';
+      const icon = tx.categories?.icon || (tx.type === 'income' ? '💰' : '💸');
+      const catName = tx.categories?.name || 'Sem categoria';
+      const cls = tx.type === 'income' ? 'positive' : 'negative';
+      const sign = tx.type === 'income' ? '+' : '-';
+      return '<div class="list-item">'
+        + '<div class="item-icon" style="background:' + color + '22;color:' + color + '">' + icon + '</div>'
+        + '<div class="item-info">'
+        + '<div class="item-name">' + tx.description + '</div>'
+        + '<div class="item-sub">' + catName + ' · ' + formatDate(tx.date) + '</div>'
+        + '</div>'
+        + '<div class="item-value ' + cls + '">' + sign + formatCurrency(tx.amount) + '</div>'
+        + '</div>';
+    }).join('');
+  } else if (overviewList) {
+    overviewList.innerHTML = '<div class="empty-state">Nenhuma transação ainda</div>';
+  }
+}
+
+// ── TRANSAÇÕES ───────────────────────────────────────────────
+function renderTransactions() {
+  const container = document.getElementById('transactions-list');
+  if (!container) return;
+  const filter = document.getElementById('tx-filter')?.value || 'all';
+  const search = document.getElementById('tx-search')?.value || '';
+
+  let txs = state.transactions;
+  if (filter !== 'all') txs = txs.filter(t => t.type === filter);
+  if (search) txs = txs.filter(t => t.description.toLowerCase().includes(search.toLowerCase()));
+
+  if (!txs.length) {
+    container.innerHTML = '<div class="empty-state">Nenhuma transação encontrada</div>';
+    return;
+  }
+
+  container.innerHTML = txs.slice(0, 100).map(tx => {
+    const color = tx.categories?.color || 'var(--accent)';
+    const icon = tx.categories?.icon || (tx.type === 'income' ? '💰' : '💸');
+    const catName = tx.categories?.name || 'Sem categoria';
+    const cls = tx.type === 'income' ? 'positive' : 'negative';
+    const sign = tx.type === 'income' ? '+' : '-';
+    return '<div class="list-item">'
+      + '<div class="item-icon" style="background:' + color + '22;color:' + color + '">' + icon + '</div>'
+      + '<div class="item-info">'
+      + '<div class="item-name">' + tx.description + '</div>'
+      + '<div class="item-sub">' + catName + ' · ' + formatDate(tx.date) + '</div>'
+      + '</div>'
+      + '<div class="item-value ' + cls + '">' + sign + formatCurrency(tx.amount) + '</div>'
+      + '<button class="btn-icon" onclick="openEditTransaction(\'' + tx.id + '\')" title="Editar">✏️</button>'
+      + '<button class="btn-icon" onclick="deleteTransaction(\'' + tx.id + '\')" title="Excluir">🗑</button>'
+      + '</div>';
+  }).join('');
+}
+
+async function saveTransaction() {
+  const type = document.getElementById('tx-type').value;
+  const amount = parseFloat(document.getElementById('tx-amount').value);
+  const description = document.getElementById('tx-description').value.trim();
+  const categoryId = document.getElementById('tx-category').value || null;
+  const date = document.getElementById('tx-date').value;
+  const notes = document.getElementById('tx-notes').value;
+
+  if (!amount || !description || !date) {
+    showToast('Preencha todos os campos', 'error'); return;
+  }
+
+  try {
+    const tx = await DB.addTransaction(type, amount, description, categoryId, date, notes);
+    state.transactions.unshift({ ...tx, categories: state.categories.find(c => c.id === categoryId) });
+    closeModal('modal-transaction');
+    renderTransactions();
+    await updateDashboardSummary();
+    showToast(`${type === 'income' ? 'Receita' : 'Gasto'} registrado!`);
+  } catch (e) {
+    showToast(e.message || 'Erro ao salvar', 'error');
+  }
+}
+
+async function deleteTransaction(id) {
+  if (!confirm('Excluir essa transação?')) return;
+  try {
+    await DB.deleteTransaction(id);
+    state.transactions = state.transactions.filter(t => t.id !== id);
+    renderTransactions();
+    await updateDashboardSummary();
+    showToast('Transação excluída');
+  } catch (e) {
+    showToast(e.message || 'Erro', 'error');
+  }
+}
+
+// ── CATEGORIAS ───────────────────────────────────────────────
+function renderCategories() {
+  const container = document.getElementById('categories-list');
+  if (!container) return;
+
+  if (!state.categories.length) {
+    container.innerHTML = `<div class="empty-state">Nenhuma categoria criada</div>`;
+  } else {
+    container.innerHTML = state.categories.map(cat => `
+      <div class="cat-item">
+        <span class="cat-icon" style="background:${cat.color}22">${cat.icon}</span>
+        <span class="cat-name">${cat.name}</span>
+        <span class="badge badge-sm" style="color:${cat.color}">
+          ${{ income:'Receita', expense:'Gasto', investment:'Investimento', saving:'Poupança', goal:'Meta', debt:'Dívida' }[cat.type] || cat.type}
+        </span>
+        <button class="btn-icon" onclick="deleteCategory('${cat.id}')">🗑</button>
+      </div>
+    `).join('');
+  }
+
+  // Popular selects de categoria nas forms
+  const selects = document.querySelectorAll('.category-select');
+  selects.forEach(sel => {
+    const current = sel.value;
+    sel.innerHTML = `<option value="">Sem categoria</option>` +
+      state.categories.map(c => `<option value="${c.id}" ${c.id === current ? 'selected' : ''}>${c.icon} ${c.name}</option>`).join('');
+  });
+}
+
+async function saveCategory() {
+  const name = document.getElementById('cat-name').value.trim();
+  const type = document.getElementById('cat-type').value;
+  const color = document.getElementById('cat-color').value;
+  const icon = document.getElementById('cat-icon').value.trim() || '📁';
+
+  if (!name) { showToast('Nome obrigatório', 'error'); return; }
+
+  try {
+    const cat = await DB.addCategory(name, type, color, icon);
+    state.categories.push(cat);
+    closeModal('modal-category');
+    renderCategories();
+    showToast('Categoria criada!');
+  } catch (e) {
+    showToast(e.message || 'Erro', 'error');
+  }
+}
+
+async function deleteCategory(id) {
+  if (!confirm('Excluir categoria?')) return;
+  try {
+    await DB.deleteCategory(id);
+    state.categories = state.categories.filter(c => c.id !== id);
+    renderCategories();
+    showToast('Categoria excluída');
+  } catch (e) {
+    showToast(e.message || 'Erro', 'error');
+  }
+}
+
+// ── POUPANÇA ─────────────────────────────────────────────────
+function renderSavingsList() {
+  const container = document.getElementById('savings-list');
+  if (!container) return;
+
+  if (!state.savings.length) {
+    container.innerHTML = `<div class="empty-state">Nenhuma poupança criada</div>`;
+    return;
+  }
+
+  container.innerHTML = state.savings.map(s => {
+    const pct = s.target_amount ? Math.min(100, (s.amount / s.target_amount) * 100) : null;
+    return `
+      <div class="saving-item card-hover">
+        <div class="saving-icon" style="background:${s.color}22">${s.icon}</div>
+        <div class="saving-info">
+          <div class="saving-name">${s.name}</div>
+          ${pct !== null ? `
+            <div class="progress-bar">
+              <div class="progress-fill" style="width:${pct}%; background:${s.color}"></div>
+            </div>
+            <div class="saving-pct">${formatCurrency(s.amount)} / ${formatCurrency(s.target_amount)} (${pct.toFixed(0)}%)</div>
+          ` : `<div class="saving-amt">${formatCurrency(s.amount)}</div>`}
+        </div>
+        <div class="saving-actions">
+          <button class="btn-sm" style="background:${s.color}22; color:${s.color}" onclick="openSavingDeposit('${s.id}','${s.name}')">+ Depositar</button>
+          <button class="btn-sm btn-ghost" onclick="openSavingWithdraw('${s.id}','${s.name}')">- Retirar</button>
+          <button class="btn-icon" onclick="openEditSaving('${s.id}')">✏️</button>
+          <button class="btn-icon" onclick="deleteSaving('${s.id}')">🗑</button>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+async function saveSaving() {
+  const name = document.getElementById('sav-name').value.trim();
+  const target = parseFloat(document.getElementById('sav-target').value) || null;
+  const color = document.getElementById('sav-color').value;
+  const icon = document.getElementById('sav-icon').value.trim() || '🏦';
+
+  if (!name) { showToast('Nome obrigatório', 'error'); return; }
+  try {
+    const s = await DB.addSaving(name, color, icon, target);
+    state.savings.push(s);
+    closeModal('modal-saving');
+    renderSavingsList();
+    showToast('Poupança criada!');
+  } catch (e) { showToast(e.message, 'error'); }
+}
+
+function openSavingDeposit(id, name) {
+  document.getElementById('savtx-id').value = id;
+  document.getElementById('savtx-type').value = 'deposit';
+  document.getElementById('savtx-title').textContent = `Depositar em ${name}`;
+  document.getElementById('savtx-date').value = new Date().toISOString().slice(0,10);
+  openModal('modal-saving-tx');
+}
+
+function openSavingWithdraw(id, name) {
+  document.getElementById('savtx-id').value = id;
+  document.getElementById('savtx-type').value = 'withdraw';
+  document.getElementById('savtx-title').textContent = `Retirar de ${name}`;
+  document.getElementById('savtx-date').value = new Date().toISOString().slice(0,10);
+  openModal('modal-saving-tx');
+}
+
+async function saveSavingTransaction() {
+  const id = document.getElementById('savtx-id').value;
+  const type = document.getElementById('savtx-type').value;
+  const amount = parseFloat(document.getElementById('savtx-amount').value);
+  const date = document.getElementById('savtx-date').value;
+  const notes = document.getElementById('savtx-notes').value;
+
+  if (!amount || !date) { showToast('Preencha os campos', 'error'); return; }
+
+  try {
+    if (type === 'deposit') await DB.depositSaving(id, amount, date, notes);
+    else await DB.withdrawSaving(id, amount, date, notes);
+    state.savings = await DB.getSavings();
+    closeModal('modal-saving-tx');
+    renderSavingsList();
+    await updateDashboardSummary();
+    showToast(type === 'deposit' ? 'Depósito realizado!' : 'Retirada realizada!');
+  } catch (e) { showToast(e.message, 'error'); }
+}
+
+async function deleteSaving(id) {
+  if (!confirm('Excluir poupança? O saldo retorna à carteira.')) return;
+  try {
+    await DB.deleteSaving(id);
+    state.savings = state.savings.filter(s => s.id !== id);
+    renderSavingsList();
+    await updateDashboardSummary();
+    showToast('Poupança removida, saldo devolvido');
+  } catch (e) { showToast(e.message, 'error'); }
+}
+
+// ── METAS ────────────────────────────────────────────────────
+function renderGoalsList() {
+  const container = document.getElementById('goals-list');
+  if (!container) return;
+
+  if (!state.goals.length) {
+    container.innerHTML = `<div class="empty-state">Nenhuma meta cadastrada</div>`;
+    return;
+  }
+
+  container.innerHTML = state.goals.map(g => {
+    const pct = Math.min(100, (g.current_amount / g.target_amount) * 100);
+    const remaining = g.target_amount - g.current_amount;
+    return `
+      <div class="goal-item card-hover ${g.is_completed ? 'completed' : ''}">
+        <div class="goal-header">
+          <span class="goal-icon" style="background:${g.color}22">${g.icon}</span>
+          <div>
+            <div class="goal-name">${g.name} ${g.is_completed ? '✅' : ''}</div>
+            ${g.deadline ? `<div class="goal-deadline">Prazo: ${formatDate(g.deadline)}</div>` : ''}
+          </div>
+          <button class="btn-icon" onclick="openEditGoal('${g.id}')">✏️</button>
+          <button class="btn-icon" onclick="deleteGoal('${g.id}')">🗑</button>
+        </div>
+        <div class="progress-bar">
+          <div class="progress-fill" style="width:${pct}%; background:${g.color}"></div>
+        </div>
+        <div class="goal-values">
+          <span>${formatCurrency(g.current_amount)} de ${formatCurrency(g.target_amount)}</span>
+          <span>${pct.toFixed(0)}%</span>
+        </div>
+        ${!g.is_completed ? `
+          <button class="btn-sm mt-8" style="background:${g.color}22; color:${g.color}" onclick="openGoalDeposit('${g.id}','${g.name}')">
+            + Adicionar ${formatCurrency(remaining)} restantes
+          </button>
+        ` : ''}
+      </div>
+    `;
+  }).join('');
+}
+
+async function saveGoal() {
+  const name = document.getElementById('goal-name').value.trim();
+  const desc = document.getElementById('goal-desc').value;
+  const target = parseFloat(document.getElementById('goal-target').value);
+  const deadline = document.getElementById('goal-deadline').value || null;
+  const color = document.getElementById('goal-color').value;
+  const icon = document.getElementById('goal-icon').value.trim() || '🎯';
+
+  if (!name || !target) { showToast('Preencha os campos obrigatórios', 'error'); return; }
+  try {
+    const g = await DB.addGoal(name, desc, target, deadline, color, icon);
+    state.goals.push(g);
+    closeModal('modal-goal');
+    renderGoalsList();
+    showToast('Meta criada!');
+  } catch (e) { showToast(e.message, 'error'); }
+}
+
+function openGoalDeposit(id, name) {
+  document.getElementById('goaltx-id').value = id;
+  document.getElementById('goaltx-title').textContent = `Adicionar à meta: ${name}`;
+  document.getElementById('goaltx-date').value = new Date().toISOString().slice(0,10);
+  openModal('modal-goal-tx');
+}
+
+async function saveGoalTransaction() {
+  const id = document.getElementById('goaltx-id').value;
+  const amount = parseFloat(document.getElementById('goaltx-amount').value);
+  const date = document.getElementById('goaltx-date').value;
+  const notes = document.getElementById('goaltx-notes').value;
+
+  if (!amount || !date) { showToast('Preencha os campos', 'error'); return; }
+  try {
+    await DB.depositGoal(id, amount, date, notes);
+    state.goals = await DB.getGoals();
+    closeModal('modal-goal-tx');
+    renderGoalsList();
+    await updateDashboardSummary();
+    showToast('Valor adicionado à meta!');
+  } catch (e) { showToast(e.message, 'error'); }
+}
+
+async function deleteGoal(id) {
+  if (!confirm('Excluir meta? O saldo retorna à carteira.')) return;
+  try {
+    await DB.deleteGoal(id);
+    state.goals = state.goals.filter(g => g.id !== id);
+    renderGoalsList();
+    await updateDashboardSummary();
+    showToast('Meta excluída, saldo devolvido');
+  } catch (e) { showToast(e.message, 'error'); }
+}
+
+// ── DÍVIDAS ──────────────────────────────────────────────────
+function renderDebtsList() {
+  const container = document.getElementById('debts-list');
+  if (!container) return;
+
+  if (!state.debts.length) {
+    container.innerHTML = `<div class="empty-state">Nenhuma dívida cadastrada</div>`;
+    return;
+  }
+
+  container.innerHTML = state.debts.map(d => {
+    const remaining = d.total_installments - d.paid_installments;
+    const remainingValue = remaining * d.installment_value;
+    const pct = (d.paid_installments / d.total_installments) * 100;
+    return `
+      <div class="debt-item card-hover">
+        <div class="debt-header">
+          <span class="debt-icon" style="background:${d.color}22">${d.icon}</span>
+          <div>
+            <div class="debt-name">${d.name}</div>
+            <div class="debt-sub">Vence dia ${d.due_day} · ${d.paid_installments}/${d.total_installments} parcelas</div>
+          </div>
+          <div class="debt-amounts">
+            <div class="negative">${formatCurrency(remainingValue)}</div>
+            <div style="font-size:11px; color:var(--text-muted)">restante</div>
+          </div>
+          <button class="btn-icon" onclick="openEditDebt('${d.id}')">✏️</button>
+          <button class="btn-icon" onclick="deleteDebt('${d.id}')">🗑</button>
+        </div>
+        <div class="progress-bar">
+          <div class="progress-fill" style="width:${pct}%; background:${d.color}"></div>
+        </div>
+        <div class="debt-footer">
+          <span style="font-size:12px; color:var(--text-muted)">${pct.toFixed(0)}% pago · Parcela: ${formatCurrency(d.installment_value)}</span>
+          ${remaining > 0 ? `<button class="btn-sm" style="background:${d.color}22; color:${d.color}" onclick="payDebtInstallment('${d.id}','${d.paid_installments + 1}','${d.installment_value}')">Pagar parcela ${d.paid_installments + 1}</button>` : '<span class="positive">✅ Quitada</span>'}
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+async function saveDebt() {
+  const name = document.getElementById('debt-name').value.trim();
+  const desc = document.getElementById('debt-desc').value;
+  const installmentVal = parseFloat(document.getElementById('debt-installment').value);
+  const totalInstallments = parseInt(document.getElementById('debt-total-inst').value);
+  const dueDay = parseInt(document.getElementById('debt-due-day').value);
+  const startDate = document.getElementById('debt-start').value;
+  const color = document.getElementById('debt-color').value;
+  const icon = document.getElementById('debt-icon').value.trim() || '💳';
+  const totalAmount = installmentVal * totalInstallments;
+
+  if (!name || !installmentVal || !totalInstallments || !dueDay || !startDate) {
+    showToast('Preencha os campos obrigatórios', 'error'); return;
+  }
+  try {
+    const d = await DB.addDebt(name, desc, totalAmount, installmentVal, totalInstallments, dueDay, startDate, color, icon);
+    state.debts.push(d);
+    closeModal('modal-debt');
+    renderDebtsList();
+    showToast('Dívida cadastrada!');
+  } catch (e) { showToast(e.message, 'error'); }
+}
+
+async function payDebtInstallment(id, installmentNumber, amount) {
+  if (!confirm(`Pagar parcela ${installmentNumber} de ${formatCurrency(parseFloat(amount))}?`)) return;
+  try {
+    await DB.payDebtInstallment(id, parseInt(installmentNumber), parseFloat(amount), new Date().toISOString().slice(0,10), '');
+    state.debts = await DB.getDebts();
+    renderDebtsList();
+    await updateDashboardSummary();
+    showToast('Parcela paga!');
+  } catch (e) { showToast(e.message, 'error'); }
+}
+
+async function deleteDebt(id) {
+  if (!confirm('Excluir dívida?')) return;
+  try {
+    await DB.deleteDebt(id);
+    state.debts = state.debts.filter(d => d.id !== id);
+    renderDebtsList();
+    showToast('Dívida removida');
+  } catch (e) { showToast(e.message, 'error'); }
+}
+
+// ── CALENDÁRIO ───────────────────────────────────────────────
+function renderCalendar() {
+  const container = document.getElementById('calendar-grid');
+  if (!container) return;
+
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = now.getMonth();
+  const today = now.getDate();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const firstDay = new Date(year, month, 1).getDay();
+
+  // Header do calendário
+  const monthName = now.toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' });
+  const calTitle = document.getElementById('calendar-month');
+  if (calTitle) calTitle.textContent = monthName.charAt(0).toUpperCase() + monthName.slice(1);
+
+  // Montar grid
+  let html = '<div class="cal-weekdays">';
+  ['Dom','Seg','Ter','Qua','Qui','Sex','Sáb'].forEach(d => { html += `<div class="cal-wd">${d}</div>`; });
+  html += '</div><div class="cal-days">';
+
+  for (let i = 0; i < firstDay; i++) html += '<div class="cal-day empty"></div>';
+
+  for (let d = 1; d <= daysInMonth; d++) {
+    const bills = state.calendarBills.filter(b => b.due_day === d);
+    const debtBills = state.debts.filter(db => db.due_day === d && db.is_active);
+    const isToday = d === today;
+    const hasBill = bills.length > 0 || debtBills.length > 0;
+
+    html += `
+      <div class="cal-day ${isToday ? 'today' : ''} ${hasBill ? 'has-bill' : ''}" onclick="showDayBills(${d})">
+        <span class="cal-day-num">${d}</span>
+        ${bills.slice(0,2).map(b => `<div class="cal-bill-dot" style="background:${b.color}" title="${b.name}: ${formatCurrency(b.amount)}"></div>`).join('')}
+        ${debtBills.slice(0,1).map(b => `<div class="cal-bill-dot" style="background:${b.color}" title="${b.name}: ${formatCurrency(b.installment_value)}"></div>`).join('')}
+      </div>
+    `;
+  }
+  html += '</div>';
+  container.innerHTML = html;
+
+  // Lista de contas do mês
+  renderBillsList();
+  // Mini calendário na visão geral
+  renderCalendarOverview();
+  if (typeof renderInvestmentsOverview === 'function') renderInvestmentsOverview();
+}
+
+// Mini calendário para visão geral
+function renderCalendarOverview() {
+  const el = document.getElementById('overview-cal-list') || document.getElementById('overview-bills-list');
+  if (!el) return;
+  const today = new Date().getDate();
+  const allBills = [
+    ...state.calendarBills.map(b => ({ name: b.name, amount: b.amount, day: b.due_day, color: b.color, icon: b.icon || '📅' })),
+    ...state.debts.filter(d => d.is_active).map(d => ({
+      name: d.name + ' (parcela ' + (d.paid_installments+1) + '/' + d.total_installments + ')',
+      amount: d.installment_value, day: d.due_day, color: d.color, icon: d.icon || '💳'
+    }))
+  ].sort((a,b) => {
+    // Ordenar: contas futuras primeiro, depois passadas
+    const da = a.day >= today ? a.day : a.day + 31;
+    const db = b.day >= today ? b.day : b.day + 31;
+    return da - db;
+  }).slice(0, 6);
+
+  if (!allBills.length) {
+    el.innerHTML = '<div class="empty-state" style="padding:16px">Nenhuma conta cadastrada</div>';
+    return;
+  }
+  el.innerHTML = allBills.map(b => {
+    const isPast = b.day < today;
+    const isToday = b.day === today;
+    const cls = isToday ? 'warning' : isPast ? 'negative' : '';
+    return '<div class="list-item" style="padding:8px 10px">'
+      + '<div style="font-size:18px;font-weight:800;font-family:var(--font-mono);min-width:32px;color:' + b.color + '">' + String(b.day).padStart(2,'0') + '</div>'
+      + '<div style="font-size:16px">' + b.icon + '</div>'
+      + '<div class="item-info"><div style="font-size:12px;font-weight:600">' + b.name + '</div>'
+      + (isToday ? '<div style="font-size:10px;color:var(--warning)">Vence hoje!</div>' : isPast ? '<div style="font-size:10px;color:var(--negative)">Vencida</div>' : '') + '</div>'
+      + '<div class="' + cls + '" style="font-family:var(--font-mono);font-size:12px;font-weight:700">' + formatCurrency(b.amount) + '</div>'
+      + '</div>';
+  }).join('');
+}
+
+function renderBillsList() {
+  const container = document.getElementById('bills-list');
+  if (!container) return;
+
+  const today = new Date().getDate();
+  const allBills = [
+    ...state.calendarBills.map(b => ({ ...b, billType: 'bill', amount: b.amount })),
+    ...state.debts.filter(d => d.is_active).map(d => ({
+      ...d, billType: 'debt', amount: d.installment_value, name: `${d.name} (parcela ${d.paid_installments+1}/${d.total_installments})`, color: d.color, icon: d.icon, due_day: d.due_day
+    }))
+  ].sort((a, b) => a.due_day - b.due_day);
+
+  if (!allBills.length) { container.innerHTML = `<div class="empty-state">Nenhuma conta cadastrada</div>`; return; }
+
+  container.innerHTML = allBills.map(b => {
+    const isPast = b.due_day < today;
+    const isToday = b.due_day === today;
+    return `
+      <div class="bill-item ${isToday ? 'bill-today' : ''} ${isPast ? 'bill-past' : ''}">
+        <div class="bill-day" style="color:${b.color}">${String(b.due_day).padStart(2,'0')}</div>
+        <div class="bill-icon">${b.icon || '📅'}</div>
+        <div class="bill-name">${b.name}</div>
+        <div class="bill-amount negative">${formatCurrency(b.amount)}</div>
+        ${b.billType === 'bill' ? `<button class="btn-icon" onclick="deleteCalendarBill('${b.id}')">🗑</button>` : ''}
+      </div>
+    `;
+  }).join('');
+}
+
+function showDayBills(day) {
+  const bills = state.calendarBills.filter(b => b.due_day === day);
+  const debts = state.debts.filter(d => d.due_day === day && d.is_active);
+  if (!bills.length && !debts.length) return;
+
+  const total = [...bills.map(b=>b.amount), ...debts.map(d=>d.installment_value)].reduce((s,v)=>s+v,0);
+  showToast(`Dia ${day}: ${bills.length + debts.length} conta(s) · Total: ${formatCurrency(total)}`, 'info');
+}
+
+async function saveCalendarBill() {
+  const name = document.getElementById('bill-name').value.trim();
+  const amount = parseFloat(document.getElementById('bill-amount').value);
+  const dueDay = parseInt(document.getElementById('bill-due-day').value);
+  const catId = document.getElementById('bill-category').value || null;
+  const isRecurring = document.getElementById('bill-recurring').checked;
+  const color = document.getElementById('bill-color').value;
+  const icon = document.getElementById('bill-icon').value.trim() || '📅';
+
+  if (!name || !amount || !dueDay) { showToast('Preencha os campos', 'error'); return; }
+  try {
+    const b = await DB.addCalendarBill(name, amount, dueDay, catId, isRecurring, color, icon);
+    state.calendarBills.push(b);
+    closeModal('modal-bill');
+    renderCalendar();
+    showToast('Conta adicionada ao calendário!');
+  } catch (e) { showToast(e.message, 'error'); }
+}
+
+async function deleteCalendarBill(id) {
+  if (!confirm('Remover conta do calendário?')) return;
+  try {
+    await DB.deleteCalendarBill(id);
+    state.calendarBills = state.calendarBills.filter(b => b.id !== id);
+    renderCalendar();
+    showToast('Conta removida');
+  } catch (e) { showToast(e.message, 'error'); }
+}
+
+
+// ── EDITAR TRANSAÇÃO ─────────────────────────────────────────
+function openEditTransaction(id) {
+  const tx = state.transactions.find(t => t.id === id);
+  if (!tx) return;
+  document.getElementById('tx-edit-id').value = id;
+  document.getElementById('tx-edit-type').value = tx.type;
+  document.getElementById('tx-edit-amount').value = tx.amount;
+  document.getElementById('tx-edit-description').value = tx.description;
+  document.getElementById('tx-edit-date').value = tx.date;
+  document.getElementById('tx-edit-notes').value = tx.notes || '';
+
+  // Popular categorias
+  const sel = document.getElementById('tx-edit-category');
+  sel.innerHTML = '<option value="">Sem categoria</option>' +
+    state.categories.map(c => '<option value="' + c.id + '"' + (c.id === tx.category_id ? ' selected' : '') + '>' + c.icon + ' ' + c.name + '</option>').join('');
+
+  openModal('modal-edit-transaction');
+}
+
+async function saveEditTransaction() {
+  const id = document.getElementById('tx-edit-id').value;
+  const type = document.getElementById('tx-edit-type').value;
+  const amount = parseFloat(document.getElementById('tx-edit-amount').value);
+  const description = document.getElementById('tx-edit-description').value.trim();
+  const categoryId = document.getElementById('tx-edit-category').value || null;
+  const date = document.getElementById('tx-edit-date').value;
+  const notes = document.getElementById('tx-edit-notes').value;
+
+  if (!amount || !description || !date) { showToast('Preencha todos os campos', 'error'); return; }
+  try {
+    await DB.updateTransaction(id, type, amount, description, categoryId, date, notes);
+    state.transactions = await DB.getTransactions();
+    closeModal('modal-edit-transaction');
+    renderTransactions();
+    await updateDashboardSummary();
+    showToast('Transação atualizada!');
+  } catch(e) { showToast(e.message || 'Erro', 'error'); }
+}
+
+// ── EDITAR INVESTIMENTO ───────────────────────────────────────
+function openEditInvestment(id) {
+  const inv = allInvestments.find(i => i.id === id);
+  if (!inv) return;
+  document.getElementById('inv-edit-id').value = id;
+  document.getElementById('inv-edit-ticker').textContent = inv.ticker;
+  document.getElementById('inv-edit-qty').value = inv.quantity;
+  document.getElementById('inv-edit-price').value = inv.avg_price;
+  document.getElementById('inv-edit-notes').value = inv.notes || '';
+  openModal('modal-edit-investment');
+}
+
+async function saveEditInvestment() {
+  const id = document.getElementById('inv-edit-id').value;
+  const qty = parseFloat(document.getElementById('inv-edit-qty').value);
+  const price = parseFloat(document.getElementById('inv-edit-price').value);
+  const notes = document.getElementById('inv-edit-notes').value;
+  if (!qty || !price) { showToast('Preencha os campos', 'error'); return; }
+  try {
+    await DB.updateInvestment(id, qty, price, notes);
+    await loadInvestments();
+    closeModal('modal-edit-investment');
+    await updateDashboardSummary();
+    showToast('Investimento atualizado!');
+  } catch(e) { showToast(e.message || 'Erro', 'error'); }
+}
+
+// ── RESET TOTAL ───────────────────────────────────────────────
+async function resetAllData() {
+  const confirm1 = confirm('⚠️ ATENÇÃO: Isso vai apagar TODOS os seus dados financeiros (transações, investimentos, poupança, metas, dívidas). Essa ação não pode ser desfeita!\n\nTem certeza?');
+  if (!confirm1) return;
+  const confirm2 = confirm('Última confirmação: apagar TUDO mesmo?');
+  if (!confirm2) return;
+  try {
+    showToast('Resetando dados...', 'info');
+    await DB.resetAllData();
+    state.transactions = [];
+    state.investments = [];
+    state.savings = [];
+    state.goals = [];
+    state.debts = [];
+    state.calendarBills = [];
+    state.wallet = { balance: 0, total_income: 0, total_expense: 0 };
+    allInvestments = [];
+    closeModal('modal-settings');
+    renderAll();
+    showToast('Todos os dados foram apagados!', 'info');
+  } catch(e) { showToast(e.message || 'Erro ao resetar', 'error'); }
+}
+
+// ── AUTH UI ──────────────────────────────────────────────────
+function showAuthScreen() {
+  document.getElementById('auth-screen').style.display = 'flex';
+  document.getElementById('app-screen').style.display = 'none';
+}
+
+function showAppScreen() {
+  document.getElementById('auth-screen').style.display = 'none';
+  document.getElementById('app-screen').style.display = 'block';
+}
+
+async function handleLogin() {
+  const email = document.getElementById('login-email').value.trim();
+  const password = document.getElementById('login-password').value;
+  if (!email || !password) { showToast('Preencha email e senha', 'error'); return; }
+
+  try {
+    showLoader(true);
+    await signIn(email, password);
+    showAppScreen();
+    await loadAllData();
+    showLoader(false);
+  } catch (e) {
+    showLoader(false);
+    showToast(e.message || 'Credenciais inválidas', 'error');
+  }
+}
+
+async function handleSignup() {
+  const name = document.getElementById('signup-name').value.trim();
+  const email = document.getElementById('signup-email').value.trim();
+  const password = document.getElementById('signup-password').value;
+  if (!name || !email || !password) { showToast('Preencha todos os campos', 'error'); return; }
+  if (password.length < 6) { showToast('Senha mínimo 6 caracteres', 'error'); return; }
+
+  try {
+    showLoader(true);
+    await signUp(email, password, name);
+    showLoader(false);
+    showToast('Conta criada! Verifique seu email para confirmar.', 'info');
+    toggleAuthTab('login');
+  } catch (e) {
+    showLoader(false);
+    showToast(e.message || 'Erro ao criar conta', 'error');
+  }
+}
+
+function toggleAuthTab(tab) {
+  document.getElementById('login-form').style.display = tab === 'login' ? 'block' : 'none';
+  document.getElementById('signup-form').style.display = tab === 'signup' ? 'block' : 'none';
+  document.querySelectorAll('.auth-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+}
+
+// ── UTILITÁRIOS ──────────────────────────────────────────────
+function setEl(id, content) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = content;
+}
+
+function showLoader(show) {
+  const el = document.getElementById('app-loader');
+  if (el) el.style.display = show ? 'flex' : 'none';
+}
+
+function setupEventListeners() {
+  // Enter nos inputs de login
+  document.getElementById('login-password')?.addEventListener('keydown', e => { if (e.key === 'Enter') handleLogin(); });
+
+  // Busca de transações
+  document.getElementById('tx-search')?.addEventListener('input', e => {
+    renderTransactions(document.getElementById('tx-filter').value, e.target.value);
+  });
+  document.getElementById('tx-filter')?.addEventListener('change', e => {
+    renderTransactions(e.target.value, document.getElementById('tx-search').value);
+  });
+
+  // Fechar modais com ESC
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+      document.querySelectorAll('.modal-overlay.active').forEach(m => {
+        m.classList.remove('active');
+        document.body.style.overflow = '';
+      });
+    }
+  });
+}
+
+
+// ── EDITAR TRANSAÇÃO ─────────────────────────────────────────
+function openEditTransaction(id) {
+  const tx = state.transactions.find(t => t.id === id);
+  if (!tx) return;
+  document.getElementById('txedit-id').value = id;
+  document.getElementById('txedit-type').value = tx.type;
+  document.getElementById('txedit-amount').value = tx.amount;
+  document.getElementById('txedit-description').value = tx.description;
+  document.getElementById('txedit-date').value = tx.date;
+  document.getElementById('txedit-notes').value = tx.notes || '';
+  // popular categorias
+  const sel = document.getElementById('txedit-category');
+  sel.innerHTML = '<option value="">Sem categoria</option>'
+    + state.categories.map(c => '<option value="' + c.id + '"' + (c.id === tx.category_id ? ' selected' : '') + '>' + c.icon + ' ' + c.name + '</option>').join('');
+  openModal('modal-edit-transaction');
+}
+
+async function saveEditTransaction() {
+  const id = document.getElementById('txedit-id').value;
+  const type = document.getElementById('txedit-type').value;
+  const amount = parseFloat(document.getElementById('txedit-amount').value);
+  const description = document.getElementById('txedit-description').value.trim();
+  const categoryId = document.getElementById('txedit-category').value || null;
+  const date = document.getElementById('txedit-date').value;
+  const notes = document.getElementById('txedit-notes').value;
+  if (!amount || !description || !date) { showToast('Preencha os campos', 'error'); return; }
+  try {
+    await DB.updateTransaction(id, type, amount, description, categoryId, date, notes);
+    state.transactions = await DB.getTransactions();
+    closeModal('modal-edit-transaction');
+    renderTransactions();
+    await updateDashboardSummary();
+    showToast('Transação atualizada!');
+  } catch(e) { showToast(e.message || 'Erro', 'error'); }
+}
+
+// ── RESET COMPLETO ────────────────────────────────────────────
+async function resetAllData() {
+  const confirmMsg = 'ATENÇÃO: Isso vai apagar TODOS os seus dados (transações, investimentos, poupança, metas, dívidas, categorias). Essa ação não pode ser desfeita.\n\nDigite CONFIRMAR para prosseguir:';
+  const input = prompt(confirmMsg);
+  if (input !== 'CONFIRMAR') { showToast('Reset cancelado', 'info'); return; }
+  try {
+    showToast('Apagando dados...', 'info');
+    await DB.resetAllUserData();
+    state = { wallet: null, transactions: [], categories: [], investments: [], savings: [], goals: [], debts: [], calendarBills: [], activeSection: 'overview' };
+    await loadAllData();
+    closeModal('modal-settings');
+    showToast('Todos os dados foram apagados!');
+  } catch(e) { showToast(e.message || 'Erro ao resetar', 'error'); }
+}
+
+
+// ── EDITAR META ───────────────────────────────────────────────
+function openEditGoal(id) {
+  const g = state.goals.find(x => x.id === id);
+  if (!g) return;
+  document.getElementById('goaledit-id').value = id;
+  document.getElementById('goaledit-name').value = g.name;
+  document.getElementById('goaledit-desc').value = g.description || '';
+  document.getElementById('goaledit-target').value = g.target_amount;
+  document.getElementById('goaledit-deadline').value = g.deadline || '';
+  document.getElementById('goaledit-color').value = g.color || '#f59e0b';
+  document.getElementById('goaledit-icon').value = g.icon || '🎯';
+  openModal('modal-edit-goal');
+}
+
+async function saveEditGoal() {
+  const id = document.getElementById('goaledit-id').value;
+  const name = document.getElementById('goaledit-name').value.trim();
+  const desc = document.getElementById('goaledit-desc').value;
+  const target = parseFloat(document.getElementById('goaledit-target').value);
+  const deadline = document.getElementById('goaledit-deadline').value || null;
+  const color = document.getElementById('goaledit-color').value;
+  const icon = document.getElementById('goaledit-icon').value.trim() || '🎯';
+  if (!name || !target) { showToast('Preencha os campos', 'error'); return; }
+  try {
+    const { error } = await getSupabase().from('goals').update({ name, description: desc, target_amount: target, deadline, color, icon }).eq('id', id).eq('user_id', getCurrentUser().id);
+    if (error) throw error;
+    state.goals = await DB.getGoals();
+    closeModal('modal-edit-goal');
+    renderGoalsList();
+    showToast('Meta atualizada!');
+  } catch(e) { showToast(e.message || 'Erro', 'error'); }
+}
+
+// ── EDITAR DÍVIDA ─────────────────────────────────────────────
+function openEditDebt(id) {
+  const d = state.debts.find(x => x.id === id);
+  if (!d) return;
+  document.getElementById('debtedit-id').value = id;
+  document.getElementById('debtedit-name').value = d.name;
+  document.getElementById('debtedit-desc').value = d.description || '';
+  document.getElementById('debtedit-installment').value = d.installment_value;
+  document.getElementById('debtedit-due-day').value = d.due_day;
+  document.getElementById('debtedit-color').value = d.color || '#ef4444';
+  document.getElementById('debtedit-icon').value = d.icon || '💳';
+  openModal('modal-edit-debt');
+}
+
+async function saveEditDebt() {
+  const id = document.getElementById('debtedit-id').value;
+  const name = document.getElementById('debtedit-name').value.trim();
+  const desc = document.getElementById('debtedit-desc').value;
+  const installment = parseFloat(document.getElementById('debtedit-installment').value);
+  const dueDay = parseInt(document.getElementById('debtedit-due-day').value);
+  const color = document.getElementById('debtedit-color').value;
+  const icon = document.getElementById('debtedit-icon').value.trim() || '💳';
+  if (!name || !installment || !dueDay) { showToast('Preencha os campos', 'error'); return; }
+  try {
+    const d = state.debts.find(x => x.id === id);
+    const newTotal = installment * (d?.total_installments || 1);
+    const { error } = await getSupabase().from('debts').update({ name, description: desc, installment_value: installment, total_amount: newTotal, due_day: dueDay, color, icon }).eq('id', id).eq('user_id', getCurrentUser().id);
+    if (error) throw error;
+    state.debts = await DB.getDebts();
+    closeModal('modal-edit-debt');
+    renderDebtsList();
+    await updateDashboardSummary();
+    showToast('Dívida atualizada!');
+  } catch(e) { showToast(e.message || 'Erro', 'error'); }
+}
+
+// ── EDITAR POUPANÇA ───────────────────────────────────────────
+function openEditSaving(id) {
+  const s = state.savings.find(x => x.id === id);
+  if (!s) return;
+  document.getElementById('savedit-id').value = id;
+  document.getElementById('savedit-name').value = s.name;
+  document.getElementById('savedit-target').value = s.target_amount || '';
+  document.getElementById('savedit-color').value = s.color || '#10b981';
+  document.getElementById('savedit-icon').value = s.icon || '🏦';
+  openModal('modal-edit-saving');
+}
+
+async function saveEditSaving() {
+  const id = document.getElementById('savedit-id').value;
+  const name = document.getElementById('savedit-name').value.trim();
+  const target = parseFloat(document.getElementById('savedit-target').value) || null;
+  const color = document.getElementById('savedit-color').value;
+  const icon = document.getElementById('savedit-icon').value.trim() || '🏦';
+  if (!name) { showToast('Nome obrigatório', 'error'); return; }
+  try {
+    const { error } = await getSupabase().from('savings').update({ name, target_amount: target, color, icon }).eq('id', id).eq('user_id', getCurrentUser().id);
+    if (error) throw error;
+    state.savings = await DB.getSavings();
+    closeModal('modal-edit-saving');
+    renderSavingsList();
+    showToast('Poupança atualizada!');
+  } catch(e) { showToast(e.message || 'Erro', 'error'); }
+}
+
+// Iniciar
+document.addEventListener('DOMContentLoaded', initApp);
